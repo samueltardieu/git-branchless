@@ -23,6 +23,12 @@ pub enum Error {
         error: rusqlite::Error,
     },
 
+    #[error("Could not query parents for node {node:?}: {error}")]
+    QueryParents {
+        node: Box<dyn Debug>,
+        error: Box<dyn std::error::Error>,
+    },
+
     #[error("Could not build in-memory graph: {0}")]
     BuildGraph(Box<Error>),
 
@@ -42,9 +48,10 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub trait DagBackend {
+    type Error: Debug + std::error::Error + 'static;
     type Node: Clone + Debug + Eq + Ord + Hash + AsRef<[u8]> + 'static;
 
-    fn get_parents(&self, node: &Self::Node) -> Vec<Self::Node>;
+    fn get_parents(&self, node: &Self::Node) -> std::result::Result<Vec<Self::Node>, Self::Error>;
 }
 
 pub struct Dag<B: DagBackend> {
@@ -143,7 +150,13 @@ WHERE name = :name
                     continue;
                 }
 
-                let parents = self.backend.get_parents(&node);
+                let parents =
+                    self.backend
+                        .get_parents(&node)
+                        .map_err(|error| Error::QueryParents {
+                            node: Box::new(node.clone()),
+                            error: Box::new(error),
+                        })?;
                 graph.insert(node, parents.clone());
                 next.extend(parents);
             }
@@ -163,7 +176,8 @@ WHERE name = :name
             ReadyToAssign(T),
         }
 
-        let mut nodes_to_assign: Vec<State<&B::Node>> = vec![State::WaitingForParents(initial_node)];
+        let mut nodes_to_assign: Vec<State<&B::Node>> =
+            vec![State::WaitingForParents(initial_node)];
         let mut assigned_nodes: HashSet<&B::Node> = HashSet::new();
         while let Some(node_to_assign) = nodes_to_assign.pop() {
             match node_to_assign {
@@ -256,13 +270,18 @@ mod tests {
     struct TestingDagBackend;
 
     impl DagBackend for TestingDagBackend {
+        type Error = std::convert::Infallible;
         type Node = String;
 
-        fn get_parents(&self, node: &Self::Node) -> Vec<Self::Node> {
-            match node.as_str() {
+        fn get_parents(
+            &self,
+            node: &Self::Node,
+        ) -> std::result::Result<Vec<Self::Node>, Self::Error> {
+            let parents = match node.as_str() {
                 "foo" => vec!["bar".to_string()],
                 _ => vec![],
-            }
+            };
+            Ok(parents)
         }
     }
 
