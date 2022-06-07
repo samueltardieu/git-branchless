@@ -9,43 +9,84 @@ use thiserror::Error;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId(usize);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Segment {
+    level: usize,
+    parents: Vec<NodeId>,
+    start: NodeId,
+    end: NodeId,
+}
+
+impl Segment {
+    fn contains(&self, id: NodeId) -> bool {
+        self.start <= id && id <= self.end
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Could not open database: {0}")]
-    OpenDatabase(rusqlite::Error),
+    OpenDatabase(#[source] rusqlite::Error),
 
     #[error("Could not initialize database: {0}")]
-    InitializeDatabase(rusqlite::Error),
+    InitializeDatabase(#[source] rusqlite::Error),
 
     #[error("Could not insert into database: {0}")]
-    InsertIntoDatabase(rusqlite::Error),
+    InsertIntoDatabase(#[source] rusqlite::Error),
+
+    #[error("Could not query for node with ID {node_id:?}: {error}")]
+    QueryNode {
+        node_id: NodeId,
+        #[source]
+        error: Box<dyn std::error::Error>,
+    },
+
+    #[error("Could not find node with ID {node_id:?}")]
+    QueryNodeNotFound { node_id: NodeId },
 
     #[error("Could not query for ID for node {node:?}: {error}")]
     QueryNodeId {
         node: Box<dyn Debug>,
+        #[source]
+        error: Box<dyn std::error::Error>,
+    },
+
+    #[error("Could not query for segment containing node {node:?}: {error}")]
+    QuerySegment {
+        node: Box<dyn Debug>,
+        #[source]
         error: rusqlite::Error,
     },
 
     #[error("Could not query parents for node {node:?}: {error}")]
     QueryParents {
         node: Box<dyn Debug>,
+        #[source]
         error: Box<dyn std::error::Error>,
     },
 
     #[error("Could not build in-memory graph: {0}")]
-    BuildGraph(Box<Error>),
+    BuildGraph(#[source] Box<Error>),
 
     #[error("Could not assign ID for node {node:?}: {error}")]
     AssignNodeIds {
         node: Box<dyn Debug>,
+        #[source]
         error: Box<Error>,
     },
 
     #[error("Could not create node {node:?}: {error}")]
     AssignNodeId {
         node: Box<dyn Debug>,
+        #[source]
         error: rusqlite::Error,
     },
+
+    #[error("Could not save segment: {0}")]
+    SaveSegment(#[source] rusqlite::Error),
+
+    #[error("Backend error: {0}")]
+    BackendError(#[source] Box<dyn std::error::Error>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -55,6 +96,7 @@ pub trait DagBackend {
     type Node: Clone + Debug + Eq + Ord + Hash + AsRef<[u8]> + 'static;
 
     fn get_parents(&self, node: &Self::Node) -> std::result::Result<Vec<Self::Node>, Self::Error>;
+    fn try_from_bytes(&self, bytes: Vec<u8>) -> std::result::Result<Self::Node, Self::Error>;
 }
 
 pub struct Dag<B: DagBackend> {
@@ -87,14 +129,38 @@ names (
 
 CREATE TABLE IF NOT EXISTS
 segments (
+    level INTEGER NOT NULL,
     parents TEXT NOT NULL,
     start INTEGER NOT NULL,
-    end INTEGER NOT NULL
+    end INTEGER NOT NULL,
+    PRIMARY KEY (level, start)
 );
 "#,
             )
             .map_err(Error::InitializeDatabase)?;
         Ok(())
+    }
+
+    pub fn make_set(&mut self, node: &B::Node) -> Result<CommitSet> {
+        let node_id = self.make_node(node)?;
+        let parents = self.query_parents(node)?;
+        let parent_ids: Vec<NodeId> = parents
+            .into_iter()
+            .map(|parent| {
+                let node_id = self.query_node_id(&parent)?;
+                Ok(node_id.expect("Parent ID should exist"))
+            })
+            .collect::<Result<_>>()?;
+
+        let segment = Segment {
+            level: 0,
+            parents: parent_ids,
+            start: node_id,
+            end: node_id,
+        };
+        Ok(CommitSet {
+            segments: vec![segment],
+        })
     }
 
     pub fn make_node(&mut self, node: &B::Node) -> Result<NodeId> {
@@ -107,22 +173,11 @@ segments (
                 error: Box::new(error),
             })?;
 
-        let id: usize = self
-            .db
-            .query_row(
-                "
-SELECT id
-FROM names
-WHERE name = :name
-",
-                named_params! {":name": node.as_ref()},
-                |row| row.get(0),
-            )
-            .map_err(|error| Error::QueryNodeId {
-                node: Box::new(node.clone()),
-                error,
-            })?;
-        let id = NodeId(id);
+        let id = self
+            .query_node_id(node)?
+            .expect("Should have just created the node ID");
+        let segment = self.calculate_segment(node, &graph)?;
+        self.save_segment(&segment)?;
         Ok(id)
     }
 
@@ -168,6 +223,9 @@ WHERE name = :name
         Ok(graph)
     }
 
+    /// Assign a unique ID to each node in the graph, starting from
+    /// `initial_node` and traversing its parents. The IDs are stored in the
+    /// database. Any node which already has an ID keeps it.
     fn assign_node_ids(
         &mut self,
         graph: &HashMap<B::Node, Vec<B::Node>>,
@@ -252,6 +310,60 @@ VALUES (?)
         Ok(())
     }
 
+    fn query_parents(&self, node: &B::Node) -> Result<Vec<B::Node>> {
+        Ok(self
+            .backend
+            .get_parents(node)
+            .map_err(|error| Error::QueryParents {
+                node: Box::new(node.clone()),
+                error: Box::new(error),
+            })?)
+    }
+
+    fn query_node_or_fail(&self, node_id: NodeId) -> Result<B::Node> {
+        let node = self
+            .query_node(node_id)
+            .map_err(|error| Error::QueryNode {
+                node_id,
+                error: Box::new(error),
+            })?
+            .ok_or_else(|| Error::QueryNodeNotFound { node_id })?;
+        Ok(node)
+    }
+
+    fn query_node(&self, node_id: NodeId) -> Result<Option<B::Node>> {
+        let NodeId(id) = node_id;
+        let bytes: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "
+SELECT name
+FROM names
+WHERE id = :id
+        ",
+                named_params! {
+                    ":id": id,
+                },
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| Error::QueryNode {
+                node_id,
+                error: Box::new(error),
+            })?;
+
+        match bytes {
+            Some(bytes) => {
+                let node = self
+                    .backend
+                    .try_from_bytes(bytes)
+                    .map_err(|error| Error::BackendError(Box::new(error)))?;
+                Ok(Some(node))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn query_node_id(&self, node: &B::Node) -> Result<Option<NodeId>> {
         let node_id: Option<usize> = self
             .db
@@ -269,9 +381,180 @@ WHERE name = :name
             .optional()
             .map_err(|error| Error::QueryNodeId {
                 node: Box::new(node.clone()),
-                error,
+                error: Box::new(error),
             })?;
         Ok(node_id.map(NodeId))
+    }
+
+    fn calculate_segment(
+        &self,
+        end: &B::Node,
+        graph: &HashMap<B::Node, Vec<B::Node>>,
+    ) -> Result<Segment> {
+        let end_id = self
+            .query_node_id(end)?
+            .expect("End of segment should exist");
+        let mut start = end.clone();
+        let parents = loop {
+            let parents = match graph.get(&start) {
+                Some(parents) => parents.to_vec(),
+                None => self.query_parents(&start)?,
+            };
+
+            match parents.as_slice() {
+                [only_parent] => {
+                    start = only_parent.clone();
+                }
+                parents => {
+                    break parents.to_vec();
+                }
+            }
+        };
+
+        let parent_ids = parents
+            .iter()
+            .map(|parent| -> Result<_> {
+                let node_id = self.query_node_id(parent)?;
+                Ok(node_id.expect("Parent should exist"))
+            })
+            .collect::<Result<_>>()?;
+        let start_id = self
+            .query_node_id(&start)?
+            .expect("Start of segment should exist");
+        Ok(Segment {
+            level: 0, // higher-level segments not yet supported
+            parents: parent_ids,
+            start: start_id,
+            end: end_id,
+        })
+    }
+
+    fn save_segment(&self, segment: &Segment) -> Result<()> {
+        let Segment {
+            level,
+            parents,
+            start: NodeId(start_id),
+            end: NodeId(end_id),
+        } = segment;
+        let parents = format!(
+            "/{}/",
+            parents
+                .iter()
+                .map(|NodeId(parent_id)| parent_id.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        self.db
+            .execute(
+                "
+INSERT INTO segments (level, parents, start, end)
+VALUES (:level, :parents, :start, :end)
+ON CONFLICT DO UPDATE
+SET end = :end
+",
+                named_params! {
+                    ":level": level,
+                    ":parents": parents,
+                    ":start": start_id,
+                    ":end": end_id,
+                },
+            )
+            .map_err(Error::SaveSegment)?;
+        Ok(())
+    }
+
+    fn query(&mut self) -> Query<B> {
+        Query { dag: self }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommitSet {
+    segments: Vec<Segment>,
+}
+
+impl CommitSet {
+    pub fn union(&self, other: &CommitSet) -> CommitSet {
+        let Self { segments } = self;
+        let CommitSet {
+            segments: other_segments,
+        } = other;
+        CommitSet {
+            segments: [segments.clone(), other_segments.clone()].concat(),
+        }
+    }
+}
+
+struct Query<'a, B: DagBackend> {
+    dag: &'a mut Dag<B>,
+}
+
+impl<'a, B: DagBackend> Query<'a, B> {
+    pub fn commits(&mut self, nodes: &[B::Node]) -> Result<CommitSet> {
+        let nodes: Vec<_> = nodes
+            .into_iter()
+            .map(|node| self.dag.make_set(&node))
+            .collect::<Result<_>>()?;
+        let commits: CommitSet = nodes
+            .into_iter()
+            .fold(Default::default(), |acc, item| acc.union(&item));
+        Ok(commits)
+    }
+
+    pub fn resolve(&mut self, commits: &CommitSet) -> Result<Vec<B::Node>> {
+        let mut result = Vec::new();
+        for segment in &commits.segments {
+            let NodeId(start) = segment.start;
+            let NodeId(end) = segment.end;
+            for i in start..=end {
+                result.push(self.dag.query_node_or_fail(NodeId(i))?);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn heads(&self, commits: CommitSet) -> Result<CommitSet> {
+        let head_segments = commits.segments.iter().filter(|segment| {
+            for other in &commits.segments {
+                for parent in &segment.parents {
+                    if other.contains(*parent) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+        let segments = head_segments
+            .into_iter()
+            .map(|head_segment| Segment {
+                end: head_segment.start,
+                ..head_segment.clone()
+            })
+            .collect();
+        Ok(CommitSet { segments })
+    }
+
+    pub fn roots(&self, commits: CommitSet) -> Result<CommitSet> {
+        let root_segments = commits.segments.iter().filter(|segment| {
+            for other in &commits.segments {
+                for parent in &other.parents {
+                    if segment.contains(*parent) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+        let segments = root_segments
+            .into_iter()
+            .map(|head_segment| Segment {
+                end: head_segment.start,
+                ..head_segment.clone()
+            })
+            .collect();
+        Ok(CommitSet { segments })
     }
 }
 
@@ -282,7 +565,7 @@ mod tests {
     struct TestingDagBackend;
 
     impl DagBackend for TestingDagBackend {
-        type Error = std::convert::Infallible;
+        type Error = std::string::FromUtf8Error;
         type Node = String;
 
         fn get_parents(
@@ -296,6 +579,10 @@ mod tests {
             };
             Ok(parents)
         }
+
+        fn try_from_bytes(&self, bytes: Vec<u8>) -> std::result::Result<Self::Node, Self::Error> {
+            String::from_utf8(bytes)
+        }
     }
 
     type TestingDag = Dag<TestingDagBackend>;
@@ -304,6 +591,12 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().map_err(Error::InitializeDatabase)?;
         let dag = Dag::open_from_conn(TestingDagBackend, conn)?;
         Ok(dag)
+    }
+
+    #[test]
+    fn test_init() -> Result<()> {
+        let _: TestingDag = make_in_memory_dag()?;
+        Ok(())
     }
 
     #[test]
@@ -322,6 +615,56 @@ mod tests {
         assert!(bar_id < baz_id);
         assert!(foo_id < baz_id);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_node() -> Result<()> {
+        let mut dag = make_in_memory_dag()?;
+        let foo_id = dag.make_node(&"foo".to_string())?;
+        let bar_id = dag.make_node(&"bar".to_string())?;
+        let commits = dag
+            .query()
+            .commits(&["foo".to_string(), "bar".to_string()])?;
+        assert_eq!(
+            commits.segments,
+            vec![
+                Segment {
+                    level: 0,
+                    parents: vec![bar_id],
+                    start: foo_id,
+                    end: foo_id,
+                },
+                Segment {
+                    level: 0,
+                    parents: vec![],
+                    start: bar_id,
+                    end: bar_id,
+                }
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_heads() -> Result<()> {
+        let mut dag = make_in_memory_dag()?;
+        let commits = dag
+            .query()
+            .commits(&["foo".to_string(), "bar".to_string()])?;
+        let commits = dag.query().heads(commits)?;
+        assert_eq!(dag.query().resolve(&commits)?, vec!["bar".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_roots() -> Result<()> {
+        let mut dag = make_in_memory_dag()?;
+        let commits = dag
+            .query()
+            .commits(&["foo".to_string(), "bar".to_string()])?;
+        let commits = dag.query().roots(commits)?;
+        assert_eq!(dag.query().resolve(&commits)?, vec!["foo".to_string()]);
         Ok(())
     }
 }
