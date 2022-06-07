@@ -1,4 +1,4 @@
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -16,6 +16,9 @@ pub enum Error {
 
     #[error("Could not initialize database: {0}")]
     InitializeDatabase(rusqlite::Error),
+
+    #[error("Could not insert into database: {0}")]
+    InsertIntoDatabase(rusqlite::Error),
 
     #[error("Could not query for ID for node {node:?}: {error}")]
     QueryNodeId {
@@ -131,7 +134,7 @@ WHERE name = :name
     /// This graph may not be complete. If a node has already been registered
     /// in the database, then it may be omitted as a key from the resulting graph.
     fn build_graph(&self, node: B::Node) -> Result<HashMap<B::Node, Vec<B::Node>>> {
-        let mut current = {
+        let mut current: HashSet<B::Node> = {
             let mut current = HashSet::new();
             current.insert(node);
             current
@@ -157,8 +160,8 @@ WHERE name = :name
                             node: Box::new(node.clone()),
                             error: Box::new(error),
                         })?;
-                graph.insert(node, parents.clone());
-                next.extend(parents);
+                next.extend(parents.iter().cloned());
+                graph.insert(node.to_owned(), parents);
             }
             current = next;
         }
@@ -166,7 +169,7 @@ WHERE name = :name
     }
 
     fn assign_node_ids(
-        &self,
+        &mut self,
         graph: &HashMap<B::Node, Vec<B::Node>>,
         initial_node: &B::Node,
     ) -> Result<()> {
@@ -179,9 +182,14 @@ WHERE name = :name
         let mut nodes_to_assign: Vec<State<&B::Node>> =
             vec![State::WaitingForParents(initial_node)];
         let mut assigned_nodes: HashSet<&B::Node> = HashSet::new();
+        let mut assigned_nodes_in_order: Vec<&B::Node> = Vec::new();
         while let Some(node_to_assign) = nodes_to_assign.pop() {
             match node_to_assign {
                 State::WaitingForParents(node_to_assign) => {
+                    if !assigned_nodes.insert(node_to_assign) {
+                        continue;
+                    }
+
                     let parents = match graph.get(node_to_assign) {
                         Some(parents) => parents,
                         None => {
@@ -198,44 +206,48 @@ WHERE name = :name
                 State::ReadyToAssign(node_to_assign) => {
                     // Skip reassigning the same node if we've already seen it (such as
                     // if two nodes have the same parent).
-                    if !assigned_nodes.insert(node_to_assign) {
-                        continue;
+                    assigned_nodes_in_order.push(node_to_assign);
+                }
+            }
+        }
+
+        let tx = self.db.transaction().map_err(Error::InsertIntoDatabase)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "
+INSERT INTO names (name)
+VALUES (?)
+",
+                )
+                .map_err(Error::InsertIntoDatabase)?;
+            for node in assigned_nodes_in_order {
+                let result = stmt.execute(params![node.as_ref()]);
+                match result {
+                    Ok(_) => {
+                        // ID assignment succeeded, do nothing.
                     }
 
-                    let result = self.db.execute(
-                        "
-INSERT INTO names (name)
-VALUES (:name)
-",
-                        named_params! {
-                            ":name": node_to_assign.as_ref(),
+                    Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ErrorCode::ConstraintViolation,
+                            ..
                         },
-                    );
-                    match result {
-                        Ok(_) => {
-                            // ID assignment succeeded, do nothing.
-                        }
+                        _,
+                    )) => {
+                        // An ID was already assigned for this element, do nothing.
+                    }
 
-                        Err(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error {
-                                code: rusqlite::ErrorCode::ConstraintViolation,
-                                ..
-                            },
-                            _,
-                        )) => {
-                            // An ID was already assigned for this element, do nothing.
-                        }
-
-                        Err(error) => {
-                            return Err(Error::AssignNodeId {
-                                node: Box::new(initial_node.clone()),
-                                error,
-                            });
-                        }
+                    Err(error) => {
+                        return Err(Error::AssignNodeId {
+                            node: Box::new(initial_node.clone()),
+                            error,
+                        });
                     }
                 }
             }
         }
+        tx.commit().map_err(Error::InsertIntoDatabase)?;
 
         Ok(())
     }
@@ -279,6 +291,7 @@ mod tests {
         ) -> std::result::Result<Vec<Self::Node>, Self::Error> {
             let parents = match node.as_str() {
                 "foo" => vec!["bar".to_string()],
+                "baz" => vec!["bar".to_string(), "foo".to_string()],
                 _ => vec![],
             };
             Ok(parents)
@@ -304,6 +317,10 @@ mod tests {
         assert!(bar_id < foo_id, "parent node {bar_id:?} should have smaller ID (been assigned first) than child node {foo_id:?}");
         assert_eq!(foo_id, NodeId(2));
         assert_eq!(bar_id, NodeId(1));
+
+        let baz_id = dag.make_node(&"baz".to_string())?;
+        assert!(bar_id < baz_id);
+        assert!(foo_id < baz_id);
 
         Ok(())
     }
