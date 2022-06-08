@@ -6,20 +6,20 @@ use std::path::Path;
 
 use thiserror::Error;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Segment {
     level: usize,
-    parents: Vec<NodeId>,
-    start: NodeId,
-    end: NodeId,
+    parent_ids: Vec<NodeId>,
+    start_id: NodeId,
+    end_id: NodeId,
 }
 
 impl Segment {
     fn contains(&self, id: NodeId) -> bool {
-        self.start <= id && id <= self.end
+        self.start_id <= id && id <= self.end_id
     }
 }
 
@@ -154,9 +154,9 @@ segments (
 
         let segment = Segment {
             level: 0,
-            parents: parent_ids,
-            start: node_id,
-            end: node_id,
+            parent_ids,
+            start_id: node_id,
+            end_id: node_id,
         };
         Ok(CommitSet {
             segments: vec![segment],
@@ -251,12 +251,16 @@ segments (
                     let parents = match graph.get(node_to_assign) {
                         Some(parents) => parents,
                         None => {
-                            // This was a leaf node, which indicates that it was already assigned an ID. We can skip this node.
+                            // This was a leaf node, which indicates that it
+                            // was already assigned an ID. We can skip this
+                            // node.
                             continue;
                         }
                     };
 
-                    // Be sure to insert the parent nodes such that the first parent is at the top. We want to traverse the first parents first to provide a contiguous sequence of IDs.
+                    // Be sure to insert the parent nodes such that the first
+                    // parent is at the top. We want to traverse the first
+                    // parents first to provide a contiguous sequence of IDs.
                     nodes_to_assign.push(State::ReadyToAssign(node_to_assign));
                     nodes_to_assign.extend(parents.iter().rev().map(State::WaitingForParents));
                 }
@@ -423,18 +427,18 @@ WHERE name = :name
             .expect("Start of segment should exist");
         Ok(Segment {
             level: 0, // higher-level segments not yet supported
-            parents: parent_ids,
-            start: start_id,
-            end: end_id,
+            parent_ids,
+            start_id,
+            end_id,
         })
     }
 
     fn save_segment(&self, segment: &Segment) -> Result<()> {
         let Segment {
             level,
-            parents,
-            start: NodeId(start_id),
-            end: NodeId(end_id),
+            parent_ids: parents,
+            start_id: NodeId(start_id),
+            end_id: NodeId(end_id),
         } = segment;
         let parents = format!(
             "/{}/",
@@ -463,7 +467,79 @@ SET end = :end
         Ok(())
     }
 
-    fn query(&mut self) -> Query<B> {
+    fn get_singleton_segment(&self, segment: &Segment, node_id: NodeId) -> Segment {
+        assert!(segment.start_id <= node_id);
+        assert!(node_id <= segment.end_id);
+
+        let parent_ids = if node_id == segment.start_id {
+            segment.parent_ids.clone()
+        } else {
+            let NodeId(node_id) = node_id;
+            vec![NodeId(node_id.checked_sub(1).unwrap())]
+        };
+        Segment {
+            level: 0,
+            parent_ids,
+            start_id: node_id,
+            end_id: node_id,
+        }
+    }
+
+    fn query_segment(&self, node_id: NodeId) -> Result<Option<Segment>> {
+        let NodeId(node_id) = node_id;
+        let result = self
+            .db
+            .query_row(
+                "
+SELECT level, parents, start, end
+FROM segments
+WHERE :id BETWEEN start AND end
+        ",
+                named_params! {
+                    ":id": node_id,
+                },
+                |row| {
+                    let level: usize = row.get(0)?;
+                    let parents: String = row.get(1)?;
+                    let start: usize = row.get(2)?;
+                    let end: usize = row.get(3)?;
+                    Ok((level, parents, start, end))
+                },
+            )
+            .optional()
+            .map_err(|error| Error::QuerySegment {
+                node: Box::new(node_id.clone()),
+                error,
+            })?;
+
+        let (level, parents, start, end) = match result {
+            None => {
+                return Ok(None);
+            }
+            Some(result) => result,
+        };
+
+        let parents: Vec<_> = parents
+            .split("/")
+            .filter(|piece| !piece.is_empty())
+            .map(|parent| {
+                let node_id: usize = parent.parse()?;
+                Ok(NodeId(node_id))
+            })
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|error| Error::QueryNodeId {
+                node: Box::new(node_id.clone()),
+                error,
+            })?;
+        Ok(Some(Segment {
+            level,
+            parent_ids: parents,
+            start_id: NodeId(start),
+            end_id: NodeId(end),
+        }))
+    }
+
+    pub fn query(&mut self) -> Query<B> {
         Query { dag: self }
     }
 }
@@ -485,7 +561,7 @@ impl CommitSet {
     }
 }
 
-struct Query<'a, B: DagBackend> {
+pub struct Query<'a, B: DagBackend> {
     dag: &'a mut Dag<B>,
 }
 
@@ -504,8 +580,8 @@ impl<'a, B: DagBackend> Query<'a, B> {
     pub fn resolve(&mut self, commits: &CommitSet) -> Result<Vec<B::Node>> {
         let mut result = Vec::new();
         for segment in &commits.segments {
-            let NodeId(start) = segment.start;
-            let NodeId(end) = segment.end;
+            let NodeId(start) = segment.start_id;
+            let NodeId(end) = segment.end_id;
             for i in start..=end {
                 result.push(self.dag.query_node_or_fail(NodeId(i))?);
             }
@@ -516,7 +592,7 @@ impl<'a, B: DagBackend> Query<'a, B> {
     pub fn heads(&self, commits: CommitSet) -> Result<CommitSet> {
         let head_segments = commits.segments.iter().filter(|segment| {
             for other in &commits.segments {
-                for parent in &segment.parents {
+                for parent in &segment.parent_ids {
                     if other.contains(*parent) {
                         return false;
                     }
@@ -527,9 +603,9 @@ impl<'a, B: DagBackend> Query<'a, B> {
 
         let segments = head_segments
             .into_iter()
-            .map(|head_segment| Segment {
-                end: head_segment.start,
-                ..head_segment.clone()
+            .map(|head_segment| {
+                self.dag
+                    .get_singleton_segment(head_segment, head_segment.start_id)
             })
             .collect();
         Ok(CommitSet { segments })
@@ -538,7 +614,7 @@ impl<'a, B: DagBackend> Query<'a, B> {
     pub fn roots(&self, commits: CommitSet) -> Result<CommitSet> {
         let root_segments = commits.segments.iter().filter(|segment| {
             for other in &commits.segments {
-                for parent in &other.parents {
+                for parent in &other.parent_ids {
                     if segment.contains(*parent) {
                         return false;
                     }
@@ -549,12 +625,64 @@ impl<'a, B: DagBackend> Query<'a, B> {
 
         let segments = root_segments
             .into_iter()
-            .map(|head_segment| Segment {
-                end: head_segment.start,
-                ..head_segment.clone()
+            .map(|head_segment| {
+                self.dag
+                    .get_singleton_segment(head_segment, head_segment.start_id)
             })
             .collect();
         Ok(CommitSet { segments })
+    }
+
+    pub fn gca_one(&self, commits: &CommitSet) -> Result<CommitSet> {
+        let CommitSet { segments } = commits;
+
+        // Pointers to the nodes that we'll be traversing in the segment DAG.
+        let target_length = segments.len();
+        let mut roots: Vec<Segment> = segments.clone();
+
+        // Set of seen node counts, indexed by their end IDs.
+        let mut end_to_segments: HashMap<NodeId, usize> =
+            segments.iter().map(|segment| (segment.end_id, 0)).collect();
+
+        while !roots.is_empty() {
+            // Visit the parent of each current segment.
+            let parent_segments = {
+                let mut result = Vec::new();
+                for root in roots {
+                    for parent_id in &root.parent_ids {
+                        let parent_segment = match self.dag.query_segment(*parent_id)? {
+                            Some(segment) => segment,
+                            None => continue,
+                        };
+
+                        // Mark this node as visited.
+                        let count = end_to_segments.entry(parent_segment.end_id).or_default();
+                        *count += 1;
+                        if *count == target_length {
+                            // If the node was already visited, return it as a GCA.
+                            // FIXME: not correct if the original `roots`
+                            // has more than two nodes -- we need to
+                            // confirm that *all* nodes in the set reach
+                            // the same intermediate node.
+                            let segment = self.dag.query_segment(parent_segment.end_id)?.unwrap();
+                            return Ok(CommitSet {
+                                segments: vec![self
+                                    .dag
+                                    .get_singleton_segment(&segment, parent_segment.start_id)],
+                            });
+                        } else {
+                            // Otherwise, save it for the next iteration.
+                            result.push(parent_segment);
+                        }
+                    }
+                }
+                result
+            };
+            roots = parent_segments;
+        }
+
+        // Reached the roots of the entire graph without finding a GCA; return.
+        Ok(CommitSet::default())
     }
 }
 
@@ -575,6 +703,9 @@ mod tests {
             let parents = match node.as_str() {
                 "foo" => vec!["bar".to_string()],
                 "baz" => vec!["bar".to_string(), "foo".to_string()],
+                "qux" => vec!["bar".to_string()],
+                "qux2" => vec!["qux".to_string()],
+                "qux3" => vec!["qux2".to_string()],
                 _ => vec![],
             };
             Ok(parents)
@@ -607,7 +738,7 @@ mod tests {
         assert_eq!(foo_id, foo_id2);
 
         let bar_id = dag.make_node(&"bar".to_string())?;
-        assert!(bar_id < foo_id, "parent node {bar_id:?} should have smaller ID (been assigned first) than child node {foo_id:?}");
+        assert!(bar_id < foo_id, "parent node {bar_id:?} should have smallerID (been assigned first) than child node {foo_id:?}");
         assert_eq!(foo_id, NodeId(2));
         assert_eq!(bar_id, NodeId(1));
 
@@ -631,15 +762,15 @@ mod tests {
             vec![
                 Segment {
                     level: 0,
-                    parents: vec![bar_id],
-                    start: foo_id,
-                    end: foo_id,
+                    parent_ids: vec![bar_id],
+                    start_id: foo_id,
+                    end_id: foo_id,
                 },
                 Segment {
                     level: 0,
-                    parents: vec![],
-                    start: bar_id,
-                    end: bar_id,
+                    parent_ids: vec![],
+                    start_id: bar_id,
+                    end_id: bar_id,
                 }
             ]
         );
@@ -665,6 +796,17 @@ mod tests {
             .commits(&["foo".to_string(), "bar".to_string()])?;
         let commits = dag.query().roots(commits)?;
         assert_eq!(dag.query().resolve(&commits)?, vec!["foo".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_gca_one() -> Result<()> {
+        let mut dag = make_in_memory_dag()?;
+        let commits = dag
+            .query()
+            .commits(&["foo".to_string(), "qux3".to_string()])?;
+        let commits = dag.query().gca_one(&commits)?;
+        assert_eq!(dag.query().resolve(&commits)?, vec!["bar".to_string()]);
         Ok(())
     }
 }
